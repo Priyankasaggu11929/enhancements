@@ -284,9 +284,9 @@ and if so it will color pods that are running as root in red.  For example,
 > zero-width, so naively embedding color codes would visibly widen output
 > for every row, not just flagged ones. Needs either a fix to the shared
 > table printer's width calculation, or a different surface (e.g. a
-> plain-text column instead of coloring existing text). The time between
-> Alpha and Beta will be used to work out feasibility and implement this if
-> possible.
+> plain-text column instead of coloring existing text). This will be
+> evaluated for feasibility and implemented as part of a separate KEP owned
+> by SIG CLI, if possible.
 
 ### Metrics
 
@@ -361,8 +361,6 @@ gate toggled on via `tempSetCurrentKubeletConfig`. Covered cases:
 - Gather feedback from users and providers
 - e2e tests are in Testgrid and linked in KEP
 - SIG-Scalability confirms the Events are a non-issue
-- Time between Alpha and Beta used to determine if kubectl `Color`
-  highlighting is possible, and implement it if so
 
 #### GA
 
