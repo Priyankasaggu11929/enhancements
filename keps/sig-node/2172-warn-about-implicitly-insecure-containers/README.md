@@ -171,9 +171,16 @@ considered a win, since it means they thought about it and are being explicit
 about it.
 
 Warning events could add up to a lot of noise across a cluster with many
-implicitly-root pods. These Events are throttled to limit volume (one event
-per hour per pod, unless kubelet restarts). The frequency can be reduced
-further if needed.
+implicitly-root pods. To bound this, events will be throttled to at most
+1 event/pod/node/hour. The frequency can be reduced further if needed.
+
+> Note: this throttle limits repeat events for the *same* pod, but each
+> new pod gets its own fresh hour budget. So a workload that creates pods
+> repeatedly (for example, a ReplicaSet recreating replicas) still gets
+> one event per new pod, not one per hour overall. But this is no worse
+> than the existing lifecycle events (Scheduled, Pulled, Created,
+> Started) that kubelet already emits per pod, so it doesn't add
+> proportionally more noise.
 
 ## Design Details
 
@@ -224,8 +231,10 @@ not evaluated for such pods.
 ### Events when running implicitly-root
 
 Whenever kubelet sees an implicitly-root container, it will create a kubernetes
-Event object warning the user.  These events will be logged no more often than
-once per hour per pod, unless Kubelet restarts.
+Event object warning the user. These events are throttled to at most
+1 event/pod/node/hour unless kubelet restarts (also see
+[Risks and Mitigations](#risks-and-mitigations) for the rapid pod creation
+case).
 
 Also, these events will be bypassed if the user explicitly sets `runAsUser` or
 `runAsGroup` in their pod.
