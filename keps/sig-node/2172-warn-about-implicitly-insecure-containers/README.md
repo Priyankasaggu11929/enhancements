@@ -96,11 +96,13 @@ happily runs the container as root, whether it needs root or not.
 
 The following terms are defined for clarity:
 
-"implicitly-root": containers which run as UID or GID 0 and do not set
-`runAsUser` or `runAsGroup` to 0.
+"implicitly-root": containers which run with UID 0 without `runAsUser` set
+to 0, or with GID 0 (as the primary GID or as a supplemental group)
+without `runAsGroup`, `fsGroup`, or `supplementalGroups` set to 0.
 
-"explicitly-root": containers which run as UID or GID 0 but set
-`runAsUser` or `runAsGroup` to 0.
+"explicitly-root": containers which run with UID 0 with `runAsUser` set
+to 0, or with GID 0 (as the primary GID or as a supplemental group) with
+`runAsGroup`, `fsGroup`, or `supplementalGroups` set to 0.
 
 ### Goals
 
@@ -118,9 +120,11 @@ The following terms are defined for clarity:
 
 This proposal includes several parts. It depends on KEP-3619 (Fine-grained
 SupplementalGroups control), which adds the running UID and GID to Pods'
-status. KEP-3619 is already stable (as of v1.35): the effective UID/GID are
-reported in `status.containerStatuses[].user.linux.{uid,gid}`, so no new API
-field is needed here; the parts below just read those existing fields.
+status. KEP-3619 is already stable (as of v1.35): the effective UID/GID and
+resolved supplemental groups are reported in
+`status.containerStatuses[].user.linux.{uid,gid,supplementalGroups}`, so no
+new API field is needed here; the parts below just read those existing
+fields.
 
 As of now, only Linux containers are covered, matching the scope of KEP-3619:
 the effective UID/GID field this depends on is only populated for Linux
@@ -162,7 +166,8 @@ admitted or run. If a container explicitly sets `runAsUser`, the UID
 condition and event are skipped for it, no matter what value is set,
 including 0. Likewise, if a container explicitly sets `runAsGroup`, the GID
 condition and event are skipped for it, no matter what value is set,
-including 0.
+including 0. The same applies if GID 0 is requested explicitly via
+`fsGroup` or `supplementalGroups`.
 
 ### Risks and Mitigations
 
@@ -224,6 +229,35 @@ raw observed UID/GID.
 These conditions will be bypassed if the user explicitly sets `runAsUser` or
 `runAsGroup` in their pod.
 
+`InsecureGroupID` also fires if a container's supplemental groups
+(`status.containerStatuses[].user.linux.supplementalGroups`) include GID 0.
+This can happen implicitly, since `supplementalGroupsPolicy: Merge` (the
+[KEP-3619 default][supplemental-groups-policy-merge-default] when the
+field is unset) merges group memberships from the image's `/etc/group`
+into the supplemental groups list.
+
+To avoid false positives, this check:
+
+- Skips GID 0 requested explicitly via `fsGroup` or `supplementalGroups`,
+  since both feed into the same resolved supplemental groups list
+  regardless of `supplementalGroupsPolicy`.
+- Skips a container's own primary GID, which the CRI runtime always
+  copies into the reported supplemental groups list too, regardless of
+  `supplementalGroupsPolicy` (see [containerd][containerd-gid-mirror] and
+  [cri-o][cri-o-gid-mirror]).
+
+  For example, a container with `runAsGroup: 0` reports
+  `{"gid":0,"supplementalGroups":[0]}`. The `0` in `supplementalGroups`
+  here is just the mirrored primary GID, not a separate finding, so this
+  check skips it. The primary-GID check above decides the outcome
+  instead: it bypasses this case since `runAsGroup: 0` is explicit, or
+  reports it if GID 0 was implicit. Either way, the container is never
+  reported twice.
+
+[supplemental-groups-policy-merge-default]: https://github.com/kubernetes/kubernetes/blob/693b7b3db83afdf21f30d0037b528f86ee503b1f/staging/src/k8s.io/cri-api/pkg/apis/runtime/v1/api.pb.go#L233-L243
+[containerd-gid-mirror]: https://github.com/containerd/containerd/blob/a8fc3a017297f9ac4a28b115f9b706a90f497851/pkg/oci/spec_opts.go#L134-L141
+[cri-o-gid-mirror]: https://github.com/cri-o/cri-o/blob/efbce04159ead73850f34c289f333126ae9b7b88/server/container_create.go#L366-L367
+
 Per KEP-127 (User Namespaces), pods with `spec.hostUsers: false` map
 container UID/GID 0 to an unprivileged host UID/GID, so these conditions are
 not evaluated for such pods.
@@ -247,8 +281,13 @@ reasons:
 TYPE      REASON                             OBJECT                   MESSAGE
 Warning   ImplicitlyInsecureUserID           pod/uid-only-insecure    container(s) [c] running as UID 0 without runAsUser set
 Warning   ImplicitlyInsecureGroupID          pod/gid-only-insecure    container(s) [c] running as GID 0 without runAsGroup set
+Warning   ImplicitlyInsecureGroupID          pod/merge-insecure       container(s) [c] running with GID 0 merged into supplementalGroups from the image (supplementalGroupsPolicy: Merge)
 Warning   ImplicitlyInsecureUserAndGroupID   pod/both-insecure        container(s) [c] running as UID 0 without runAsUser set; container(s) [c] running as GID 0 without runAsGroup set
 ```
+
+`ImplicitlyInsecureGroupID` is used for both the primary-GID and the
+supplemental-groups case described above; the event text indicates which
+one applies.
 
 ### kubectl
 
@@ -257,13 +296,15 @@ Warning   ImplicitlyInsecureUserAndGroupID   pod/both-insecure        container(
 `kubectl describe pod` will print every entry in `pod.status.conditions`
 generically, so the `InsecureUserID`/`InsecureGroupID` conditions and their
 events will show up there with no kubectl code changes needed. For example,
-on a pod implicitly-root on GID only, the output will look something like:
+on a pod implicitly-root on GID only via `supplementalGroupsPolicy: Merge`
+(primary GID non-zero, but GID 0 merged in from the image's `/etc/group`),
+the output will look something like:
 
 ```
-$ kubectl get pod gid-only-insecure -o jsonpath='{.status.containerStatuses[0].user}'
-{"linux":{"gid":0,"supplementalGroups":[0],"uid":1000}}
+$ kubectl get pod merge-insecure -o jsonpath='{.status.containerStatuses[0].user}'
+{"linux":{"gid":1000,"supplementalGroups":[0,1000],"uid":1000}}
 
-$ kubectl describe pod gid-only-insecure
+$ kubectl describe pod merge-insecure
 ...
 Conditions:
   Type                        Status
@@ -276,9 +317,9 @@ Conditions:
   InsecureGroupID             True
 ...
 Events:
-  Type     Reason                     Age   From      Message
-  ----     ------                     ----  ----      -------
-  Warning  ImplicitlyInsecureGroupID  156m  kubelet   container(s) [c] running as GID 0 without runAsGroup set
+  Type     Reason                     Age  From     Message
+  ----     ------                     ---- ----     -------
+  Warning  ImplicitlyInsecureGroupID  17s  kubelet  container(s) [c] running with GID 0 merged into supplementalGroups from the image (supplementalGroupsPolicy: Merge)
 ```
 
 #### Color
@@ -299,13 +340,17 @@ and if so it will color pods that are running as root in red.  For example,
 
 ### Metrics
 
-Kubelet will add two gauge metrics, both labeled by `id_type` (`uid` or `gid`):
+Kubelet will add two gauge metrics, both labeled by `id_type` (`uid`, `gid`,
+or `supplementalgroups`):
 
 - `kubelet_implicitly_insecure_pods`: number of pods with an implicitly-root
-  container. A pod insecure on both UID and GID counts in both series.
+  container. A pod insecure on both UID and GID counts in both series. A
+  container's primary GID being 0 counts only in `gid`, never also in
+  `supplementalgroups`, per the exclusion described in
+  [Condition when running implicitly-root](#condition-when-running-implicitly-root).
 - `kubelet_explicitly_insecure_pods`: number of pods with a container that
-  explicitly sets `runAsUser: 0` and/or `runAsGroup: 0`, and is observed
-  running as that ID.
+  explicitly requests UID/GID 0, via `runAsUser`, `runAsGroup`, `fsGroup`,
+  or `supplementalGroups`, and is observed running as that ID.
 
 ### Test Plan
 
@@ -323,7 +368,10 @@ machinery in kubelet; no changes to existing tests are required first.
 - `pkg/kubelet/status/generate_test.go`: covers the `InsecureUserID`/
   `InsecureGroupID` conditions for implicitly-root, explicitly-root
   (bypassed), non-root, and `hostUsers: false` (bypassed) pods, and
-  explicit-root detection used by the explicit-root metric.
+  explicit-root detection used by the explicit-root metric. This will
+  also cover the `supplementalGroupsPolicy: Merge` case (implicit and
+  explicit GID 0 via `fsGroup`/`supplementalGroups`, and the primary-GID
+  mirroring exclusion).
 - `pkg/kubelet/kubelet_pods_test.go`: covers the combined vs. separate
   UID/GID event reasons and messages, and the
   `kubelet_implicitly_insecure_pods`/`kubelet_explicitly_insecure_pods`
